@@ -1,0 +1,34 @@
+# Blizzard's hourly auction snapshot of one WoW Forever auction house (EU Normal Horde), collected for the owner's Hoard addons
+# while their PC is off. What it does: blizzard_cloud.py (top of the file). Data goes to this repo's pre-releases, never git history.
+# Secrets (Settings > Secrets and variables > Actions): BLIZZARD_CLIENT_ID, BLIZZARD_CLIENT_SECRET, HOARD_NTFY_TOPIC.
+# It never goes red: problems are written to status.json in the "blizzard-cloud" release.
+name: Blizzard prices (hourly)
+
+on:
+  schedule:
+    - cron: "53 * * * *"   # Blizzard publishes at about :23; half an hour later leaves room for GitHub's own delays
+  workflow_dispatch: {}
+
+permissions:
+  contents: write          # releases only
+
+concurrency:
+  group: blizzard-cloud
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Read Blizzard's snapshot, keep it, send the phone alerts
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          BLIZZARD_CLIENT_ID: ${{ secrets.BLIZZARD_CLIENT_ID }}
+          BLIZZARD_CLIENT_SECRET: ${{ secrets.BLIZZARD_CLIENT_SECRET }}
+          HOARD_NTFY_TOPIC: ${{ secrets.HOARD_NTFY_TOPIC }}
+        run: python3 blizzard_cloud.py --collect

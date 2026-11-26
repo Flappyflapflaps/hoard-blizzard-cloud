@@ -8,6 +8,8 @@ on:
   schedule:
     - cron: "53 * * * *"   # Blizzard publishes at about :23; half an hour later leaves room for GitHub's own delays
   workflow_dispatch: {}
+  push:                    # one run straight after new code arrives, so a change is proven without waiting for :53
+    branches: [main]
 
 permissions:
   contents: write          # releases only

@@ -92,6 +92,8 @@ MAX_GAP = int(2.5 * 3600)                              # snapshots further apart
 KEEP_DAYS = 8
 SOLD_DIR = "sold"                                      # data\blizzard\sold\YYYY-MM-DD.json.gz: every listing that vanished, with its price
 SOLD_KEEP_DAYS = 35
+SOLD_PRICE_HOURS = 48                                  # Hoard is handed what each item / roll sold for over this long (sold_prices)
+SOLD_PRICE_SLACK = 1.02                                # a sale counts only when it was the cheapest listing of its key (x this): dearer ones that went are likely cancels
 SNAP_DIR = "snapshots"                                 # data\blizzard\snapshots\YYYY-MM-DD\HHMMZ.json.gz: every hourly snapshot, whole, as Blizzard sent it
 SNAP_MIN_FREE = 20 * 1024 ** 3                         # no snapshot kept while the drive has under 20 GB free (Hoard's figures go on regardless)
 SNAP_MAX_BYTES = 30 * 1024 ** 3                        # over 30 GB of snapshots (about 2 years at ~40 MB a day): the oldest days go first
@@ -552,6 +554,41 @@ def log_sold(data_dir, prev_snap, new_snap, listings, keep_days=SOLD_KEEP_DAYS):
                 pass
 
 
+def sold_prices(data_dir, now, hours=SOLD_PRICE_HOURS):
+    """{itemKey: [price, sales]} from the sold log (data\\blizzard\\sold): what each item ("2589") and roll ("15192:14307") really went for in the last
+    `hours`. Only a listing that was the cheapest of its key when it went counts (like the tip grader: a dearer one that vanished while a cheaper one
+    stayed is more likely a cancel); price = the lower middle of those (two sales: the lower one), per unit. the owner, 26 Nov 2026: "Why did none of them pop
+    up on my sniper?": the evening's five buys were found from these prices, which until now stayed on the PC. Broken rows are skipped; never raises."""
+    import time as _t
+    out = {}
+    try:
+        folder = Path(data_dir) / SOLD_DIR
+        since = int(now) - int(hours * 3600)
+        days = {_t.strftime("%Y-%m-%d", _t.gmtime(t)) for t in range(since, int(now) + 86400, 86400)}
+        units = {}
+        for day in sorted(days):
+            doc = _read_json(folder / f"{day}.json.gz", {})
+            rows = doc.get("s") if isinstance(doc, dict) else None
+            if not isinstance(rows, list):
+                continue
+            for r in rows:
+                if not isinstance(r, list) or len(r) < 6 or not isinstance(r[1], str):
+                    continue
+                unit, gone = _int(r[3], 1), _int(r[5], 0, 1e12)
+                low = _int(r[6], 0) if len(r) > 6 else 0
+                if unit is None or gone is None or gone < since or gone > now + 3600:
+                    continue
+                if low and unit > low * SOLD_PRICE_SLACK:
+                    continue
+                units.setdefault(r[1], []).append(unit)
+        for key, xs in units.items():
+            xs.sort()
+            out[key] = [xs[(len(xs) + 1) // 2 - 1], len(xs)]
+    except (OSError, ValueError, TypeError):
+        return {}
+    return out
+
+
 def _free_bytes(path):
     """Free bytes on the drive that holds path (None when unknown)."""
     import shutil
@@ -636,11 +673,13 @@ def _num(f):
 BLOCK_CHUNK = 4000          # rows per little Lua function (see block_lua)
 
 
-def block_lua(house, name, updated, summary, rates, hours, piles=None):
+def block_lua(house, name, updated, summary, rates, hours, piles=None, sold=None):
     """The text crowd_prices.py appends to Hoard\\CrowdPrices.lua (numbers and fixed words only):
     Hoard.CrowdPrices.blizzard = { house, name, updated, hours, count, items = { [itemID] = { lowest, usual, listed, perDay } },
                                    rolls = { ["itemID:suffix"] = { lowest, usual, listed, perDay } },
-                                   piles = { [itemID] = { copies, unit price } } }   (copper; perDay -1 = not known yet; piles: Hoard SPEC 240, only when given)
+                                   piles = { [itemID] = { copies, unit price } },
+                                   soldHours, sold = { ["itemID"] or ["itemID:suffix"] = { price, sales } } }
+    (copper; perDay -1 = not known yet; piles: Hoard SPEC 240, only when given; sold: what it really went for, sold_prices, only when given)
     24 Nov 2026: the rows are NOT inside an "if ... then ... end" (Lua 5.1 cannot jump over a block that big: "control structure too long", and
     then the game reads NONE of CrowdPrices.lua, TSM's prices included). They are built in a local table, BLOCK_CHUNK rows per little function
     (each Lua 5.1 function holds at most 262,143 different numbers and words), and handed to Hoard by one short "if" at the end."""
@@ -654,7 +693,8 @@ def block_lua(house, name, updated, summary, rates, hours, piles=None):
     out = ["-- Blizzard's own hourly auction-house snapshot for your auction house (tools\\blizzard_prices.py, Hoard SPEC.md section 230)",
            "do",
            f'local B = {{ v = 1, house = {int(house)}, name = "{safe_name}", updated = {int(updated)}, '
-           f"hours = {_num(hours)}, count = {len(items)}, items = {{}}, rolls = {{}}{', piles = {}' if piles else ''} }}",
+           f"hours = {_num(hours)}, count = {len(items)}, items = {{}}, rolls = {{}}{', piles = {}' if piles else ''}"
+           f"{(', soldHours = ' + str(int(SOLD_PRICE_HOURS)) + ', sold = {}') if sold else ''} }}",
            "local function put(into, rows) for k, v in pairs(rows) do into[k] = v end end"]
 
     def chunks(where, lines):
@@ -666,6 +706,10 @@ def block_lua(house, name, updated, summary, rates, hours, piles=None):
     chunks("rolls", [f'["{iid}:{rand}"]={row(k)},' for (iid, rand), k in rolls])
     if piles:
         chunks("piles", [f"[{int(iid)}]={{{int(n)},{int(unit)}}}," for iid, (n, unit) in sorted(piles.items())])
+    if sold:
+        safe = sorted((k, v) for k, v in sold.items() if isinstance(k, str) and all(p.lstrip("-").isdigit() for p in k.split(":")) and len(k.split(":")) <= 2
+                      and isinstance(v, (list, tuple)) and len(v) == 2)
+        chunks("sold", [f'["{k}"]={{{int(p)},{int(n)}}},' for k, (p, n) in safe])
     out.append('if type(Hoard) == "table" and type(Hoard.CrowdPrices) == "table" then Hoard.CrowdPrices.blizzard = B end')
     out.append("end")
     return "\n".join(out) + "\n"
@@ -822,7 +866,8 @@ def refresh(now, last=None, http=None, data_dir=None, tsm_csv=None, region=REGIO
         _write_json(data / "sales.json", days)
         rates, hours = per_day(days, new_snap)
         summary = summarize(rows)
-        _write_atomic(data / BLOCK_FILE, block_lua(house, _house_name(region), new_snap, summary, rates, hours, piles=piles(rows)))
+        sold_for = sold_prices(data, new_snap)           # (26 Nov 2026: what each roll really went for; {} when there is no sold log yet)
+        _write_atomic(data / BLOCK_FILE, block_lua(house, _house_name(region), new_snap, summary, rates, hours, piles=piles(rows), sold=sold_for))
         rec.update(snap=new_snap, lastmod=rh.get("last-modified") or "", count=len(rows))
         try:
             kept = "; " + keep_snapshot(data, new_snap, body)

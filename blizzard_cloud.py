@@ -437,6 +437,14 @@ def collect(now, api, env, work_dir, repo_dir=THIS_DIR, blizzard_http=None, tsm_
         status["ok"] = bool(brec.get("ok")) and bool(status["snap"])
         status["why"] = "" if status["ok"] else (btext or "no snapshot yet")[:300]
 
+        # 6b. the other Horde houses (PvP, RP, RP-PvP), for comparison only: nothing of theirs reaches the game (other_houses.py, 26 Nov)
+        if str(env.get("HOARD_OTHER_HOUSES", "1")).strip() != "0":
+            import other_houses
+            osum, olog = other_houses.run(now, api, (cid, sec), work, int(brec.get("house") or HOUSE),
+                                          blizzard_http=blizzard_http, tsm_fetch=tsm_fetch)
+            status["others"] = osum
+            log.extend(olog)
+
         # 7. tidy: sold days and snapshot months the cloud no longer keeps (the PC has its own copies)
         for a in list(rel.get("assets", [])):
             if a["name"].startswith("sold-") and a["name"][5:15] < _day(now - SOLD_KEEP_DAYS * 86400):
@@ -739,8 +747,13 @@ def main(argv=None):
         out = argv[i + 1] if len(argv) > i + 1 and not argv[i + 1].startswith("--") else "blizzard-cloud-data"
         days = int(argv[argv.index("--days") + 1]) if "--days" in argv else 2
         token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or git_token() or ""   # "" = a session whose proxy signs in
-        for p in fetch(GitHubReleases(token, repo=CLOUD_REPO), time.time(), out, days):
+        api = GitHubReleases(token, repo=CLOUD_REPO)
+        for p in fetch(api, time.time(), out, days):
             print(p)
+        if "--others" in argv:                               # the other Horde houses too (other_houses.py), into <dir>/others/<house>/
+            import other_houses
+            for p in other_houses.fetch(api, time.time(), out, days):
+                print(p)
         return 0
     print(__doc__)
     return 0

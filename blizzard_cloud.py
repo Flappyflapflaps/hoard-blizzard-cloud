@@ -664,6 +664,52 @@ def fetch(api, now, out_dir, days=2):
     return wrote
 
 
+# ---------------------------------------------------------------------------
+# The relay: GitHub's own hourly timer never fired in the public repo (26 Nov 2026: 10 hours, not one scheduled run), so each run
+# starts the next one itself. A run collects, waits until the next :52, starts a fresh run (a workflow's own token may start
+# a workflow_dispatch run) and ends; the fresh run collects at about :53. One relay at a time: a run that sees another run of this
+# workflow waiting or running (a push, the timer if it ever wakes, a hand-started run) leaves the baton to that one.
+
+CHAIN_MINUTE = 52
+WORKFLOW_FILE = "collect.yml"
+
+
+def next_at(now, minute=CHAIN_MINUTE):
+    """Unix time of the next hh:<minute> strictly after now."""
+    t = (int(now) // 3600) * 3600 + minute * 60
+    return t if t > now else t + 3600
+
+
+def chain(now, env, http=None, sleep=time.sleep, clock=time.time):
+    """Wait for the next :52, then start the next run unless another one is already waiting or running. Never raises."""
+    try:
+        token = str(env.get("GITHUB_TOKEN") or "")
+        repo = str(env.get("GITHUB_REPOSITORY") or CLOUD_REPO)
+        me = str(env.get("GITHUB_RUN_ID") or "")
+        http = http or GitHubReleases._http
+        wait = next_at(now) - clock()
+        if wait > 0:
+            sleep(wait)
+        hdrs = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28", "Authorization": "Bearer " + token}
+        status, _h, body = http("GET", f"{API}/repos/{repo}/actions/workflows/{WORKFLOW_FILE}/runs?per_page=20", hdrs, None)
+        if status >= 300:
+            return f"Relay: could not list runs (GitHub {status}); not starting another, the timer or a push restarts it"
+        others = [r for r in json.loads(body.decode("utf-8")).get("workflow_runs", [])
+                  if r.get("status") != "completed" and str(r.get("id")) != me]
+        if others:
+            return f"Relay: run {others[0].get('id')} is already {others[0].get('status')}; it carries on"
+        ref = str(env.get("GITHUB_REF_NAME") or "main")
+        for attempt in range(3):
+            status, _h, body = http("POST", f"{API}/repos/{repo}/actions/workflows/{WORKFLOW_FILE}/dispatches",
+                                    dict(hdrs, **{"Content-Type": "application/json"}), json.dumps({"ref": ref}).encode("utf-8"))
+            if status in (200, 204):
+                return "Relay: next run started"
+            sleep(20 * (attempt + 1))
+        return f"Relay: GitHub refused to start the next run ({status})"
+    except Exception as exc:  # noqa: BLE001 - the relay must never turn the run red
+        return f"Relay: failed ({type(exc).__name__}: {exc})"
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     if "--collect" in argv:
@@ -676,6 +722,9 @@ def main(argv=None):
         print(("OK" if status.get("ok") else "NOT OK") + f": snapshot {_stamp(status.get('snap'))} UTC, house {status.get('house')}"
               + (f" ({status['why']})" if status.get("why") else ""))
         return 0                                             # never red: status.json says what went wrong
+    if "--chain" in argv:
+        print(chain(time.time(), os.environ))
+        return 0                                             # never red
     if "--status" in argv:
         token = git_token()
         if not token:

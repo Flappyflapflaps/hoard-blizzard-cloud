@@ -46,7 +46,8 @@ SURVEY_EVERY = 7 * 86400
 SURVEY_RETRY = 6 * 3600                                # nothing matched: look again later
 OTHER_SNAP_KEEP_DAYS = 14                              # the comparison needs a week or two of snapshots; the sold logs (small) stay 35 days
 SOLD_KEEP_DAYS = 35
-MAX_OTHERS = 11                                        # never more houses than this, whatever a survey finds (Forever EU: 4 rule types x 2-3 sides)
+MAX_OTHERS = 16                                        # never more houses than this, whatever a survey finds (Forever EU, 26 Nov 2026: 15 listed)
+SURVEY_V = 2                                           # 2: houses with listings that match no TSM file are kept too (26 Nov: 116, 117)
 HOUSE_FILES = ("prev.json.gz", "sales.json")           # what each house carries from one hour to the next
 
 
@@ -73,7 +74,7 @@ def survey(now, B, http, token, tsm_get, work_dir, main_house):
     "listed": {ruleset: [house ids]}, "notes": [..]}. tsm_get(url) -> text (raises when TSM has no such file)."""
     import crowd_prices
     auth = {"Authorization": "Bearer " + token}
-    out = {"at": int(now), "houses": {}, "scores": {}, "listed": {}, "notes": []}
+    out = {"v": SURVEY_V, "at": int(now), "houses": {}, "scores": {}, "listed": {}, "notes": []}
     work = Path(work_dir)
     work.mkdir(parents=True, exist_ok=True)
 
@@ -133,6 +134,11 @@ def survey(now, B, http, token, tsm_get, work_dir, main_house):
             continue
         taken[hid] = label
         out["houses"][label] = {"house": hid, "ruleset": where[hid], "tsm": slug, "score": round(s, 3), "common": c}
+    # houses with real listings that no TSM file matches (on 26 Nov 2026 houses 116 and 117: most likely the neutral, goblin ones):
+    # kept too, last in line, under their number
+    for hid, low in sorted(lows.items()):
+        if hid not in taken and len(low) >= B.MATCH_MIN_COMMON:
+            out["houses"][f"House {hid} (no TSM file)"] = {"house": hid, "ruleset": where[hid], "tsm": "", "score": 0, "common": len(low)}
     normal = out["houses"].get(MAIN_LABEL)
     if normal and normal["house"] != main_house:
         out["notes"].append(f"check: TSM's normal-horde matched house {normal['house']}, not {main_house}")
@@ -204,7 +210,7 @@ def run(now, api, creds, work_dir, main_house, blizzard_http=None, tsm_fetch=Non
                 sv = {}
         sv = sv if isinstance(sv, dict) else {}
         age = now - int(sv.get("at") or 0)
-        due = not sv or age >= SURVEY_EVERY or (not sv.get("houses") and age >= SURVEY_RETRY)
+        due = not sv or sv.get("v") != SURVEY_V or age >= SURVEY_EVERY or (not sv.get("houses") and age >= SURVEY_RETRY)
         B.save_credentials(creds[0], creds[1], folder)  # this run's temporary folder only; never packed
         token = B.get_token(creds, now, http=http, data_dir=folder)
         if due:
